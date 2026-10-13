@@ -62,10 +62,12 @@ def load_model():
     q = BitsAndBytesConfig(
         load_in_4bit=True, bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True,
-        llm_int8_skip_modules=["visual", "lm_head"],  # ViT + projector giữ fp16
+        llm_int8_skip_modules=["model.visual", "visual", "lm_head"],  # ViT + projector giữ fp16
     )
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         MODEL_ID, quantization_config=q, dtype=torch.float16, device_map={"": 0})
+    bad = [n for n, q in model.named_parameters() if "visual" in n and not q.is_floating_point()]
+    assert not bad, f"ViT vẫn bị lượng tử hoá 4-bit: {bad[:3]}"
     processor = AutoProcessor.from_pretrained(MODEL_ID)
     processor.tokenizer.padding_side = "left"  # bắt buộc cho generate theo batch
     return model, processor
@@ -159,6 +161,15 @@ LLM_RE = r".*language_model\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|
 VIT_RE = r".*visual\.blocks\.\d+\.(attn\.(qkv|proj)|mlp\.(linear_fc1|linear_fc2))"
 PROJ_KEYS = ("visual.merger", "visual.deepstack_merger_list")
 
+def to_fp32_trainable(pm):
+    """Thay Parameter fp16 trainable bằng Parameter fp32 mới (cập nhật cả grad_dtype)."""
+    n = 0
+    for mod in pm.modules():
+        for name, p in list(mod._parameters.items()):
+            if p is not None and p.requires_grad and p.dtype != torch.float32:
+                mod._parameters[name] = torch.nn.Parameter(p.data.float(), requires_grad=True)
+                n += 1
+    return n
 
 def apply_setup(model, setup, r=16, alpha=32):
     from peft import LoraConfig, get_peft_model
@@ -171,8 +182,8 @@ def apply_setup(model, setup, r=16, alpha=32):
     if setup in ("E2", "E3"):
         for n, p in pm.named_parameters():
             if any(k in n for k in PROJ_KEYS):
-                p.data = p.data.float()        # fp32 để GradScaler unscale được
                 p.requires_grad = True
+    print(f"[fix] đã đổi {to_fp32_trainable(pm)} tham số sang fp32")
     matched = sum(1 for _, m in pm.named_modules() if hasattr(m, "lora_A"))
     trainable = sum(p.numel() for p in pm.parameters() if p.requires_grad)
     print(f"{setup}: module LoRA={matched}, tham số huấn luyện={trainable:,}")
@@ -225,7 +236,11 @@ def train(setup, out_dir, max_steps=300, bs=2, accum=4, lr=2e-4, r=16, alpha=32,
                 raise RuntimeError(f"loss không hữu hạn ở bước {step} (nguy cơ tràn fp16)")
             scaler.scale(loss).backward()
             tot += loss.item()
+        for p in params:
+            if p.grad is not None and p.grad.dtype != torch.float32:
+                p.grad = p.grad.float()
         scaler.unscale_(opt)
+        
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         scaler.step(opt)
         scaler.update()
